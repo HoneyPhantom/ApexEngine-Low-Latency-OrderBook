@@ -1,0 +1,13 @@
+name: Low-Latency Engine Build Verification
+
+on: [push, pull_request]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Configure CMake
+      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+    - name: Build Code Base
+      run: cmake --build build --config Release
