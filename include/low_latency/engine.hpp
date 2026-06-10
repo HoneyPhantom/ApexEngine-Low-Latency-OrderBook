@@ -5,23 +5,15 @@
 #include <string>
 #include <atomic>
 #include <utility>
-
-#pragma pack(push, 1)
-struct MarketDataPacket {
-    char type;         
-    uint32_t order_id; 
-    uint32_t qty;      
-    int price;         
-    char side;         
-};
-#pragma pack(pop)
+#include "concepts.hpp"
 
 static constexpr uint32_t NULL_IDX = 0xFFFFFFFF;
 static constexpr size_t CHUNK_SIZE = 64; 
 static constexpr size_t QUEUE_CAPACITY = 512;
 
+template<ValidMarketPacket PacketType>
 struct alignas(64) DataChunk {
-    MarketDataPacket packets[CHUNK_SIZE];
+    PacketType packets[CHUNK_SIZE];
     size_t valid_count = 0;
 };
 

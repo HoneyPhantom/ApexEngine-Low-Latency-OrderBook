@@ -12,21 +12,33 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "low_latency/concepts.hpp"
 #include "low_latency/engine.hpp"
 #include "low_latency/thread_utils.hpp"
 
+using ActivePacketType = NYSE_EquityPacket; 
+constexpr std::string_view ACTIVE_STREAM_ID = "NYSE_EQUITIES";
+
+constexpr std::array<SchemaConfig, 2> network_grid{{
+    { "NYSE_EQUITIES", 16, FeedProtocol::UDP_MC,     4096 },
+    { "CME_FUTURES",   24, FeedProtocol::DIRECT_DMA, 8192 }
+}};
+constexpr StaticConfigManager config_manager(network_grid);
+static_assert(config_manager.validate_packet_compatibility<ActivePacketType>(ACTIVE_STREAM_ID), "Hardware configuration map variant sizing error!");
+              
 OrderBook book;
-ZeroCopySPSC<DataChunk, QUEUE_CAPACITY> zero_copy_queue;
+ZeroCopySPSC<DataChunk<ActivePacketType>, QUEUE_CAPACITY> zero_copy_queue;
 std::atomic<bool> is_receiver_ready{false};
 
+template<ValidMarketPacket PacketType>
 class MarketDataReceiver {
 private:
     int server_fd = -1;
-    ZeroCopySPSC<DataChunk, QUEUE_CAPACITY>& queue;
+    ZeroCopySPSC<DataChunk<PacketType>, QUEUE_CAPACITY>& queue;
     int active_port = -1;
 
 public:
-    MarketDataReceiver(ZeroCopySPSC<DataChunk, QUEUE_CAPACITY>& q_ref, int base_port) : queue(q_ref) {
+    MarketDataReceiver(ZeroCopySPSC<DataChunk<PacketType>, QUEUE_CAPACITY>& q_ref, int base_port) : queue(q_ref) {
         server_fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (server_fd < 0) throw std::runtime_error("Socket creation failed");
 
@@ -68,13 +80,13 @@ public:
         pin_thread_to_core(3);
 
         size_t packets_received = 0;
-        DataChunk* current_slot = nullptr;
+        DataChunk<PacketType>* current_slot = nullptr;
         while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
         current_slot->valid_count = 0;
 
         std::cout << "Engine active. Running Zero-Copy In-Place SPSC Engine on Port " << active_port << "..." << std::endl;
 
-        alignas(64) MarketDataPacket network_buffer[65536]; 
+        alignas(64) PacketType network_buffer[65536]; 
         is_receiver_ready.store(true, std::memory_order_release);
 
         while (packets_received < max_packets_to_process) {
@@ -83,7 +95,7 @@ public:
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue; 
                 break;
             }
-            size_t packets_in_batch = static_cast<size_t>(bytes_read) / sizeof(MarketDataPacket);
+            size_t packets_in_batch = static_cast<size_t>(bytes_read) / sizeof(PacketType);
             for (size_t i = 0; i < packets_in_batch; ++i) {
                 current_slot->packets[current_slot->valid_count++] = network_buffer[i];
                 ++packets_received;
@@ -99,13 +111,14 @@ public:
     }
 };
 
-void run_matching_engine_consumer(OrderBook& book_obj, ZeroCopySPSC<DataChunk, QUEUE_CAPACITY>& q_ref, size_t total_packets) {
+template<ValidMarketPacket PacketType>
+void run_matching_engine_consumer(OrderBook& book_obj, ZeroCopySPSC<DataChunk<PacketType>, QUEUE_CAPACITY>& q_ref, size_t total_packets) {
     
     pin_thread_to_core(4);
     
     size_t processed = 0;
     while (processed < total_packets) {
-        const DataChunk* current_slot = q_ref.peek_read_slot();
+        const DataChunk<PacketType>* current_slot = q_ref.peek_read_slot();
         if (current_slot != nullptr) {
             size_t count = current_slot->valid_count;
             for (size_t i = 0; i < count; ++i) {
@@ -119,6 +132,7 @@ void run_matching_engine_consumer(OrderBook& book_obj, ZeroCopySPSC<DataChunk, Q
     }
 }
 
+template<ValidMarketPacket PacketType>
 void run_mock_exchange_tx(int port, size_t total_packets) {
     
     pin_thread_to_core(2);
@@ -136,7 +150,7 @@ void run_mock_exchange_tx(int port, size_t total_packets) {
     std::cout << "Mock Exchange Thread running on Core 2. Injecting " << total_packets << " packets into Port " << port << "..." << std::endl;
 
     const size_t packets_per_frame = 32; 
-    std::vector<MarketDataPacket> frame_buffer(packets_per_frame);
+    std::vector<PacketType> frame_buffer(packets_per_frame);
 
     uint32_t rng = 42;
     auto fast_rng = [&](uint32_t &s) -> uint32_t {
@@ -155,7 +169,7 @@ void run_mock_exchange_tx(int port, size_t total_packets) {
             frame_buffer[i].side = (r & 1) ? 'B' : 'S';
         }
 
-        sendto(client_fd, frame_buffer.data(), packets_per_frame * sizeof(MarketDataPacket), 0,
+        sendto(client_fd, frame_buffer.data(), packets_per_frame * sizeof(PacketType), 0,
                (struct sockaddr*)&serv_addr, sizeof(serv_addr));
 
         packets_sent += packets_per_frame;
@@ -170,7 +184,7 @@ int main() {
     using clock = std::chrono::steady_clock;
 
     try {
-        MarketDataReceiver receiver(zero_copy_queue, BASE_PORT);
+        MarketDataReceiver<ActivePacketType> receiver(zero_copy_queue, BASE_PORT);
         int resolved_port = receiver.get_active_port();
 
         std::cout << "Starting Lock-Free ZERO-COPY SPSC Pipeline..." << std::endl;
@@ -178,11 +192,11 @@ int main() {
         std::cout << "IO Network Thread    -> Core 3" << std::endl;
         std::cout << "Matching Engine Core -> Core 4" << std::endl;
 
-        std::thread exchange_thread(run_mock_exchange_tx, resolved_port, TOTAL_PACKETS);
+        std::thread exchange_thread(run_mock_exchange_tx<ActivePacketType>, resolved_port, TOTAL_PACKETS);
         
         auto start_time = clock::now();
 
-        std::thread engine_thread(run_matching_engine_consumer, std::ref(book), std::ref(zero_copy_queue), TOTAL_PACKETS);
+        std::thread engine_thread(run_matching_engine_consumer<ActivePacketType>, std::ref(book), std::ref(zero_copy_queue), TOTAL_PACKETS);
         receiver.run_receiver_loop(TOTAL_PACKETS);
         
         if (engine_thread.joinable()) engine_thread.join();
@@ -194,6 +208,7 @@ int main() {
 
         std::cout << "\n================ ENGINE RUN STATS ================" << std::endl;
         std::cout << "Total Data Streamed    : " << TOTAL_PACKETS << " Packets" << std::endl;
+        std::cout << "Packet Core Footprint  : " << sizeof(ActivePacketType) << " Bytes" << std::endl;
         std::cout << "Total Processing Time  : " << duration << " microseconds" << std::endl;
         std::cout << "Average Cost Per Packet: " << (double)duration * 1000.0 / TOTAL_PACKETS << " nanoseconds" << std::endl;
         std::cout << "Final Matching State   : Best Bid: " << book.get_best_bid() 

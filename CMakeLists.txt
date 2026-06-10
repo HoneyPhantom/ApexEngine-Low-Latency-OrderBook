@@ -8,10 +8,13 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(-O3 -march=native -Wall -Wextra -Wpedantic -Werror)
 endif()
 
+find_package(Threads REQUIRED)
+
 include_directories(include)
 
 add_executable(apex_runner apps/main.cpp)
 
+target_link_libraries(apex_runner PRIVATE Threads::Threads)
 if(APPLE)
     target_link_libraries(apex_runner PRIVATE "-framework CoreFoundation")
 endif()

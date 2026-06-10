@@ -1,0 +1,14 @@
+# Prerequisites
+build/
+bin/
+obj/
+
+# Generated Binaries
+apps/main
+apex_runner
+
+# OS & IDE caches
+.DS_Store
+.vscode/
+.idea/
+*.swp
