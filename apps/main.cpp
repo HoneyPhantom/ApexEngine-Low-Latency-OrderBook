@@ -28,6 +28,22 @@
     #define STORE_SIMD(ptr, val) _mm512_storeu_si512(ptr, val)
     #define MAC_SIMD(acc, mul1, mul2) _mm512_add_epi32(acc, _mm512_mullo_epi32(mul1, mul2))
     #define SET1_SIMD(val) _mm512_set1_epi32(val)
+#else
+    //included this for GitHub Actions CI Environment
+    #define SIMD_W 4
+    struct simd_reg { uint32_t lanes[4]; };
+    inline simd_reg LOAD_SIMD(const uint32_t* ptr) {
+        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = ptr[i]; return r;
+    }
+    inline void STORE_SIMD(uint32_t* ptr, simd_reg val) {
+        for(int i=0; i<4; ++i) ptr[i] = val.lanes[i];
+    }
+    inline simd_reg MAC_SIMD(simd_reg acc, simd_reg mul1, simd_reg mul2) {
+        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = acc.lanes[i] + (mul1.lanes[i] * mul2.lanes[i]); return r;
+    }
+    inline simd_reg SET1_SIMD(uint32_t val) {
+        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = val; return r;
+    }
 #endif
 
 #include "low_latency/concepts.hpp"
@@ -47,6 +63,8 @@ static_assert(config_manager.validate_packet_compatibility<ActivePacketType>(ACT
 OrderBook book;
 ZeroCopySPSC<DataChunk<ActivePacketType>, QUEUE_CAPACITY> zero_copy_queue;
 std::atomic<bool> is_receiver_ready{false};
+
+alignas(64) static ActivePacketType global_network_buffer[65536];
 
 template<ValidMarketPacket PacketType>
 class MarketDataReceiver {
@@ -104,18 +122,17 @@ public:
 
         std::cout << "Engine active. Running Zero-Copy In-Place SPSC Engine on Port " << active_port << "..." << std::endl;
 
-        alignas(64) PacketType network_buffer[65536]; 
         is_receiver_ready.store(true, std::memory_order_release);
 
         while (packets_received < max_packets_to_process) {
-            ssize_t bytes_read = recv(server_fd, network_buffer, sizeof(network_buffer), 0);
+            ssize_t bytes_read = recv(server_fd, global_network_buffer, sizeof(global_network_buffer), 0);
             if (bytes_read < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue; 
                 break;
             }
             size_t packets_in_batch = static_cast<size_t>(bytes_read) / sizeof(PacketType);
             for (size_t i = 0; i < packets_in_batch; ++i) {
-                current_slot->packets[current_slot->valid_count++] = network_buffer[i];
+                current_slot->packets[current_slot->valid_count++] = global_network_buffer[i];
                 ++packets_received;
                 if (current_slot->valid_count == CHUNK_SIZE) {
                     queue.commit_write(); 
