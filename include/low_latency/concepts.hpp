@@ -4,6 +4,8 @@
 #include <concepts>
 #include <type_traits>
 #include <array>
+#include <stdexcept>
+
 template<typename T>
 concept ValidMarketPacket = 
     std::is_trivially_copyable_v<T> && 
@@ -80,7 +82,7 @@ struct alignas(4) NYSE_EquityPacket {
 #pragma pack(pop)
 
 #pragma pack(push, 1)
-struct CME_FuturePacket {
+struct alignas(4) CME_FuturePacket {
     char type;          // 1 byte
     uint64_t timestamp; // 8 bytes
     uint32_t order_id;  // 4 bytes

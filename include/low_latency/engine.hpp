@@ -1,3 +1,5 @@
+#pragma once
+
 #include <iostream>
 #include <algorithm>
 #include <vector>
@@ -5,6 +7,7 @@
 #include <string>
 #include <atomic>
 #include <utility>
+#include <new>
 #include "concepts.hpp"
 
 static constexpr uint32_t NULL_IDX = 0xFFFFFFFF;
@@ -162,24 +165,63 @@ inline int idx(int price){ return price - MIN_PRICE; }
 template<int Levels>
 class Pricemap {
 private:
-    static constexpr size_t BLOCKS = (Levels + 63) / 64;
-    uint64_t masks[BLOCKS] = {0};
+    static constexpr size_t BLOCKS1 = (Levels + 63) / 64;
+    static constexpr size_t BLOCKS2 = (BLOCKS1 + 63) / 64;
+    uint64_t mask_level1[BLOCKS1] = {0};
+    uint64_t mask_level2[BLOCKS2] = {0};
+
 public:
-    inline void set(int idx) { masks[idx >> 6] |= (1ULL << (idx & 63)); } 
-    inline void clear(int idx) { masks[idx >> 6] &= ~(1ULL << (idx & 63)); }
+    inline void set(int idx) {
+        const int l1_idx = idx >> 6, l2_idx = l1_idx >> 6;
+        mask_level1[l1_idx] |= (1ULL << (idx & 63));
+        mask_level2[l2_idx] |= (1ULL << (l1_idx & 63)); 
+    }
+    inline void clear(int idx) {
+        const int l1_idx = idx >> 6, l2_idx = l1_idx >> 6;
+        mask_level1[l1_idx] &= ~(1ULL << (idx & 63));
+        if(!mask_level1[l1_idx]) {
+            mask_level2[l2_idx] &= ~(1ULL << (l1_idx & 63));
+        }
+    }
     inline int find_max() const {
-        for(int i = static_cast<int>(BLOCKS) - 1; i >= 0; --i) {
-            if (masks[i]) return (i << 6) | (63 - __builtin_clzll(masks[i]));
+        if constexpr (BLOCKS2 == 1) {
+            if (mask_level2[0]) {
+                int l2_bit = 63 - __builtin_clzll(mask_level2[0]);
+                return (l2_bit << 6) | (63 - __builtin_clzll(mask_level1[l2_bit]));
+            }
+        } 
+        else {
+            for(int i = static_cast<int>(BLOCKS2) - 1; i >= 0; --i) {
+                if (mask_level2[i]) {
+                    int l2_bit = 63 - __builtin_clzll(mask_level2[i]);
+                    int block_idx = (i << 6) | l2_bit;
+                    return (block_idx << 6) | (63 - __builtin_clzll(mask_level1[block_idx]));
+                }
+            }
         }
         return -1;
     }
     inline int find_min() const {
-        for(int i = 0; i < BLOCKS; ++i) {
-            if (masks[i]) return static_cast<int>((i << 6) | (__builtin_ctzll(masks[i])));
+        if constexpr (BLOCKS2 == 1) {
+            if (mask_level2[0]) {
+                int l2_bit = __builtin_ctzll(mask_level2[0]);
+                return (l2_bit << 6) | __builtin_ctzll(mask_level1[l2_bit]);
+            }
+        } 
+        else {
+            for(size_t i = 0; i < BLOCKS2; ++i) {
+                if (mask_level2[i]) {
+                    int l2_bit = __builtin_ctzll(mask_level2[i]);
+                    size_t block_idx = (i << 6) | l2_bit;
+                    return static_cast<int>((block_idx << 6) | (__builtin_ctzll(mask_level1[block_idx])));
+                }
+            }
         }
         return -1;
     }
 };
+
+enum Side : bool { Sell = false, Buy = true };
 
 class alignas(64) OrderBook {
 private:
@@ -206,47 +248,31 @@ private:
         asks[price_idx].push(get_raw_pool() , id);
         ask_mask.set(price_idx);
     }
-    void handle_buy(int price , uint32_t qty){
+    
+    template<Side S>
+    [[gnu::always_inline]] void handle_order(int price, uint32_t qty) {
+        constexpr bool IsBuy = (S == Side::Buy);
         Order* raw_pool = get_raw_pool();
+        auto& target_levels = *(IsBuy ? &asks : &bids);
+        auto& target_mask  = IsBuy ? ask_mask : bid_mask;
         while(qty > 0){
-            int best_ask_idx = ask_mask.find_min();
-            if(best_ask_idx == -1 || best_ask_idx + MIN_PRICE > price) break;
-            Level& lvl = asks[best_ask_idx];
+            int best_idx = IsBuy ? target_mask.find_min() : target_mask.find_max();
+            if(best_idx == -1 || (IsBuy ? (best_idx + MIN_PRICE > price) : (best_idx + MIN_PRICE < price))) break;
+            auto& lvl = target_levels[best_idx];
             while(qty > 0 && !lvl.empty()){
                 uint32_t id = lvl.top();
                 Order& o = pool[id];
-                uint32_t traded = branchless_min(o.qty , qty);
+                uint32_t traded = branchless_min(o.qty, qty);
                 o.qty -= traded;
                 qty -= traded;
-                if(o.qty == 0){
-                    uint32_t done = lvl.pop(raw_pool);
-                    pool.destroy(done);
-                }
+                if(o.qty == 0) pool.destroy(lvl.pop(raw_pool));
             }
-            if(lvl.empty()) ask_mask.clear(best_ask_idx);
+            if(lvl.empty()) target_mask.clear(best_idx);
         }
-        if(qty > 0) enqueue_bid(price , qty);
-    }
-    void handle_sell(int price , uint32_t qty){
-        Order* raw_pool = get_raw_pool();
-        while(qty > 0){
-            int best_bid_idx = bid_mask.find_max();
-            if(best_bid_idx == -1 || best_bid_idx + MIN_PRICE < price) break;
-            Level& lvl = bids[best_bid_idx];
-            while(qty > 0 && !lvl.empty()){
-                uint32_t id = lvl.top();
-                Order& o = pool[id];
-                uint32_t traded = branchless_min(o.qty , qty);
-                o.qty -= traded;
-                qty -= traded;
-                if(o.qty == 0){
-                    uint32_t done = lvl.pop(raw_pool);
-                    pool.destroy(done);
-                }
-            }
-            if(lvl.empty()) bid_mask.clear(best_bid_idx);
+        if(qty > 0) {
+            if constexpr (IsBuy) enqueue_bid(price, qty);
+            else enqueue_ask(price, qty);
         }
-        if(qty > 0) enqueue_ask(price , qty);
     }
 public:
     inline Order* get_raw_pool() { return pool.get_base_ptr(); }
@@ -259,8 +285,8 @@ public:
         return idx == -1 ? -1 : idx + MIN_PRICE; 
     }
     void add_in_limit(bool is_buy , int price , uint32_t qty){
-        if(price < MIN_PRICE || price > MAX_PRICE) return;
-        if(is_buy) handle_buy(price , qty);
-        else handle_sell(price , qty);
+        if(price < MIN_PRICE || price > MAX_PRICE) [[unlikely]] return;
+        if(is_buy) handle_order<Side::Buy>(price, qty);
+        else handle_order<Side::Sell>(price, qty);
     }
 };

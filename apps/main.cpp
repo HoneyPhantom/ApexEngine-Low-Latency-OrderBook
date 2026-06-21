@@ -12,12 +12,30 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(__ARM_NEON)
+    #include <arm_neon.h>
+    #define SIMD_W 4
+    typedef uint32x4_t simd_reg;
+    #define LOAD_SIMD(ptr) vld1q_u32(ptr)
+    #define STORE_SIMD(ptr, val) vst1q_u32(ptr, val)
+    #define MAC_SIMD(acc, mul1, mul2) vmlaq_u32(acc, mul1, mul2)
+    #define SET1_SIMD(val) vdupq_n_u32(val)
+#elif defined(__AVX512F__)
+    #include <immintrin.h>
+    #define SIMD_W 16
+    typedef __m512i simd_reg;
+    #define LOAD_SIMD(ptr) _mm512_loadu_si512(ptr)
+    #define STORE_SIMD(ptr, val) _mm512_storeu_si512(ptr, val)
+    #define MAC_SIMD(acc, mul1, mul2) _mm512_add_epi32(acc, _mm512_mullo_epi32(mul1, mul2))
+    #define SET1_SIMD(val) _mm512_set1_epi32(val)
+#endif
+
 #include "low_latency/concepts.hpp"
 #include "low_latency/engine.hpp"
 #include "low_latency/thread_utils.hpp"
 
-using ActivePacketType = NYSE_EquityPacket; 
-constexpr std::string_view ACTIVE_STREAM_ID = "NYSE_EQUITIES";
+using ActivePacketType = CME_FuturePacket; 
+constexpr std::string_view ACTIVE_STREAM_ID = "CME_FUTURES";
 
 constexpr std::array<SchemaConfig, 2> network_grid{{
     { "NYSE_EQUITIES", 16, FeedProtocol::UDP_MC,     4096 },
@@ -52,7 +70,7 @@ public:
         setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
         bool bound_successfully = false;
-        for (int offset = 0; offset < 28; ++offset) {
+        for (int offset = 0; offset < 4; ++offset) {
             int current_port = base_port + offset;
             sockaddr_in address{};
             address.sin_family = AF_INET;
@@ -152,21 +170,30 @@ void run_mock_exchange_tx(int port, size_t total_packets) {
     const size_t packets_per_frame = 32; 
     std::vector<PacketType> frame_buffer(packets_per_frame);
 
-    uint32_t rng = 42;
-    auto fast_rng = [&](uint32_t &s) -> uint32_t {
-        s = s * 1664525u + 1013904223u;
-        return s;
-    };
+    alignas(64) uint32_t rng[SIMD_W];
+    for(int i = 0; i < SIMD_W; ++i) rng[i] = 42 + (i * 1000);
+
+    simd_reg v_state = LOAD_SIMD(rng);
+    simd_reg v_a = SET1_SIMD(1664525u);
+    simd_reg v_c = SET1_SIMD(1013904223u);
 
     size_t packets_sent = 0;
     while (packets_sent < total_packets) {
-        for (size_t i = 0; i < packets_per_frame; ++i) {
-            uint32_t r = fast_rng(rng);
-            frame_buffer[i].type = 'Q';
-            frame_buffer[i].order_id = static_cast<uint32_t>(packets_sent + i + 1);
-            frame_buffer[i].qty = 1 + (r % 20);
-            frame_buffer[i].price = MIN_PRICE + (r % LEVELS);
-            frame_buffer[i].side = (r & 1) ? 'B' : 'S';
+        for (size_t i = 0; i < packets_per_frame; i += SIMD_W) {
+            
+            v_state = MAC_SIMD(v_state, v_a , v_c);
+            
+            alignas(64) uint32_t results[SIMD_W];
+            STORE_SIMD(results, v_state);
+
+            for(size_t j = 0; j < SIMD_W; ++j) {
+                size_t idx = i + j;
+                frame_buffer[idx].type = 'Q';
+                frame_buffer[idx].order_id = static_cast<uint32_t>(packets_sent + idx + 1);
+                frame_buffer[idx].qty = 1 + (results[j] % 20);
+                frame_buffer[idx].price = MIN_PRICE + (results[j] % LEVELS);
+                frame_buffer[idx].side = (results[j] & 1) ? 'B' : 'S';
+            }
         }
 
         sendto(client_fd, frame_buffer.data(), packets_per_frame * sizeof(PacketType), 0,
