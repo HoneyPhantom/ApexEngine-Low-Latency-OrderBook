@@ -64,8 +64,6 @@ OrderBook book;
 ZeroCopySPSC<DataChunk<ActivePacketType>, QUEUE_CAPACITY> zero_copy_queue;
 std::atomic<bool> is_receiver_ready{false};
 
-alignas(64) static ActivePacketType global_network_buffer[65536];
-
 template<ValidMarketPacket PacketType>
 class MarketDataReceiver {
 private:
@@ -124,21 +122,31 @@ public:
 
         is_receiver_ready.store(true, std::memory_order_release);
 
+        constexpr size_t MAX_PACKETS_PER_NETWORK_FRAME = 32;
+
         while (packets_received < max_packets_to_process) {
-            ssize_t bytes_read = recv(server_fd, global_network_buffer, sizeof(global_network_buffer), 0);
+            size_t spaces_left = CHUNK_SIZE - current_slot->valid_count;
+            if (spaces_left < MAX_PACKETS_PER_NETWORK_FRAME) [[unlikely]] {
+                queue.commit_write();
+                while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
+                current_slot->valid_count = 0;
+                spaces_left = CHUNK_SIZE;
+            }
+            size_t max_bytes_to_read = spaces_left * sizeof(PacketType);
+            ssize_t bytes_read = recv(server_fd, &current_slot->packets[current_slot->valid_count], max_bytes_to_read, 0);
+
             if (bytes_read < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue; 
                 break;
             }
+
             size_t packets_in_batch = static_cast<size_t>(bytes_read) / sizeof(PacketType);
-            for (size_t i = 0; i < packets_in_batch; ++i) {
-                current_slot->packets[current_slot->valid_count++] = global_network_buffer[i];
-                ++packets_received;
-                if (current_slot->valid_count == CHUNK_SIZE) {
-                    queue.commit_write(); 
-                    while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
-                    current_slot->valid_count = 0;
-                }
+            current_slot->valid_count += packets_in_batch;
+            packets_received += packets_in_batch;
+            if (current_slot->valid_count == CHUNK_SIZE) {
+                queue.commit_write(); 
+                while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
+                current_slot->valid_count = 0;
             }
         }
         if (current_slot && current_slot->valid_count > 0) queue.commit_write();

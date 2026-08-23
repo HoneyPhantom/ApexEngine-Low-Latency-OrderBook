@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.22)
 project(ApexEngine LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -14,8 +13,10 @@ find_package(Threads REQUIRED)
 
 include_directories(include)
 
+# -------------------------------------------------------------------
+# Main Pipeline Application
+# -------------------------------------------------------------------
 add_executable(apex_runner apps/main.cpp)
-
 target_link_libraries(apex_runner PRIVATE Threads::Threads)
 if(APPLE)
     target_link_libraries(apex_runner PRIVATE "-framework CoreFoundation")
@@ -34,16 +35,14 @@ endif()
 # Google Benchmark Framework Integration
 # -------------------------------------------------------------------
 include(FetchContent)
-
 FetchContent_Declare(
-  googlebenchmark
-  GIT_REPOSITORY https://github.com/google/benchmark.git
-  GIT_TAG        v1.8.3
+    googlebenchmark
+    GIT_REPOSITORY https://github.com/google/benchmark.git
+    GIT_TAG        v1.8.3
 )
 
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
-
 FetchContent_MakeAvailable(googlebenchmark)
 
 add_executable(apex_benchmark benchmarks/book_benchmark.cpp)
