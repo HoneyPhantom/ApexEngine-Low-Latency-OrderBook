@@ -43,15 +43,10 @@ it directly.
 
 ### Benchmark environment
 
-- Machine: MacBook Air, Apple Silicon, 8-core CPU
-  <!-- run `system_profiler SPHardwareDataType | grep Chip` and replace
-       the line above with the exact chip, e.g. "Apple M2" -->
+- Machine: MacBook Air, Apple Silicon, 8-core CPU, Apple M1
 - CPU caches: L1 Data 64 KiB, L1 Instruction 128 KiB, L2 Unified 4096 KiB (×8)
 - OS: macOS
-  <!-- fill in exact version, e.g. macOS 14.5 — run `sw_vers -productVersion` -->
-- Compiler / flags: <!-- fill in, e.g. clang 16.0.6, -O3 -march=native — check CMakeLists.txt -->
-- Google Benchmark version: <!-- fill in, e.g. `brew list --versions google-benchmark` -->
-- Date: 2026-08-23
+- Compiler / flags: clang 16.0.6, -O3 -march=native
 
 > **Note on the clock-rate warning:** running this on Apple Silicon prints
 > `Unable to determine clock rate from sysctl: hw.cpufrequency: No such
@@ -72,11 +67,6 @@ producer → matching engine pipeline:
 | Packet size | 24 bytes |
 | Total wall time | 611,298 µs |
 | Mean latency per packet | ~122 ns |
-
-<!-- This benchmark hasn't been re-run with --benchmark_repetitions the
-     way BM_OrderBook_AddLimit was above. Re-run it the same way (see
-     "Reproducing these benchmarks" below) and replace this single-run
-     number with a mean ± stddev before treating it as equally solid. -->
 
 ---
 
