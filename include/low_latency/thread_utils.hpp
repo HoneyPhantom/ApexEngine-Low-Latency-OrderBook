@@ -28,3 +28,11 @@ inline void pin_thread_to_core(int core_id) {
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 #endif
 }
+
+inline void hardware_spin_relax() {
+#if defined(__ARM_ARCH) || defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    asm volatile("pause" ::: "memory");
+#endif
+}

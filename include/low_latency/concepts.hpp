@@ -82,12 +82,12 @@ struct alignas(4) NYSE_EquityPacket {
 #pragma pack(pop)
 
 #pragma pack(push, 1)
-struct alignas(4) CME_FuturePacket {
-    char type;          // 1 byte
+struct alignas(8) CME_FuturePacket {
     uint64_t timestamp; // 8 bytes
     uint32_t order_id;  // 4 bytes
     uint32_t qty;       // 4 bytes
     int32_t price;      // 4 bytes
+    char type;          // 1 byte
     char side;          // 1 byte
     char pad[2];        // 2 bytes
 };                      // Total: 24 bytes

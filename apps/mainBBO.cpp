@@ -29,25 +29,25 @@
     #define MAC_SIMD(acc, mul1, mul2) _mm512_add_epi32(acc, _mm512_mullo_epi32(mul1, mul2))
     #define SET1_SIMD(val) _mm512_set1_epi32(val)
 #else
-    //included this for GitHub Actions CI Environment
     #define SIMD_W 4
     struct simd_reg { uint32_t lanes[4]; };
     inline simd_reg LOAD_SIMD(const uint32_t* ptr) {
-        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = ptr[i]; return r;
+        simd_reg r; for(int i = 0; i < 4; ++i) r.lanes[i] = ptr[i]; return r;
     }
     inline void STORE_SIMD(uint32_t* ptr, simd_reg val) {
-        for(int i=0; i<4; ++i) ptr[i] = val.lanes[i];
+        for(int i = 0; i < 4; ++i) ptr[i] = val.lanes[i];
     }
     inline simd_reg MAC_SIMD(simd_reg acc, simd_reg mul1, simd_reg mul2) {
-        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = acc.lanes[i] + (mul1.lanes[i] * mul2.lanes[i]); return r;
+        simd_reg r; for(int i = 0; i < 4; ++i) r.lanes[i] = acc.lanes[i] + (mul1.lanes[i] * mul2.lanes[i]); return r;
     }
     inline simd_reg SET1_SIMD(uint32_t val) {
-        simd_reg r; for(int i=0; i<4; ++i) r.lanes[i] = val; return r;
+        simd_reg r; for(int i = 0; i < 4; ++i) r.lanes[i] = val; return r;
     }
 #endif
 
 #include "low_latency/concepts.hpp"
-#include "low_latency/engine.hpp"
+#include "low_latency/ZeroCopySPSC.hpp"
+#include "low_latency/BBO_engine.hpp"
 #include "low_latency/thread_utils.hpp"
 
 using ActivePacketType = CME_FuturePacket; 
@@ -60,11 +60,11 @@ constexpr std::array<SchemaConfig, 2> network_grid{{
 constexpr StaticConfigManager config_manager(network_grid);
 static_assert(config_manager.validate_packet_compatibility<ActivePacketType>(ACTIVE_STREAM_ID), "Hardware configuration map variant sizing error!");
               
-OrderBook book;
+alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) BBOBook bbo_book;
 ZeroCopySPSC<DataChunk<ActivePacketType>, QUEUE_CAPACITY> zero_copy_queue;
 std::atomic<bool> is_receiver_ready{false};
 
-template<ValidMarketPacket PacketType>
+template<typename PacketType>
 class MarketDataReceiver {
 private:
     int server_fd = -1;
@@ -79,7 +79,7 @@ public:
         int flags = fcntl(server_fd, F_GETFL, 0);
         fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
 
-        int rcvbuf_size = 8 * 1024 * 1024;
+        int rcvbuf_size = 16 * 1024 * 1024;
         setsockopt(server_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
 
         int opt = 1;
@@ -110,7 +110,6 @@ public:
     int get_active_port() const { return active_port; }
 
     void run_receiver_loop(size_t max_packets_to_process) {
-        
         pin_thread_to_core(3);
 
         size_t packets_received = 0;
@@ -118,8 +117,7 @@ public:
         while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
         current_slot->valid_count = 0;
 
-        std::cout << "Engine active. Running Zero-Copy In-Place SPSC Engine on Port " << active_port << "..." << std::endl;
-
+        std::cout << "[Receiver] Active on Port " << active_port << "..." << std::endl;
         is_receiver_ready.store(true, std::memory_order_release);
 
         constexpr size_t MAX_PACKETS_PER_NETWORK_FRAME = 32;
@@ -132,57 +130,69 @@ public:
                 current_slot->valid_count = 0;
                 spaces_left = CHUNK_SIZE;
             }
+
             size_t max_bytes_to_read = spaces_left * sizeof(PacketType);
             ssize_t bytes_read = recv(server_fd, &current_slot->packets[current_slot->valid_count], max_bytes_to_read, 0);
 
             if (bytes_read < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue; 
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    hardware_spin_relax();
+                    continue; 
+                }
                 break;
             }
 
             size_t packets_in_batch = static_cast<size_t>(bytes_read) / sizeof(PacketType);
             current_slot->valid_count += packets_in_batch;
             packets_received += packets_in_batch;
+
             if (current_slot->valid_count == CHUNK_SIZE) {
                 queue.commit_write(); 
                 while ((current_slot = queue.get_write_slot()) == nullptr) hardware_spin_relax();
                 current_slot->valid_count = 0;
             }
         }
-        if (current_slot && current_slot->valid_count > 0) queue.commit_write();
-        std::cout << "Target boundary satisfied. Processing halted." << std::endl;
+
+        if (current_slot && current_slot->valid_count > 0) {
+            queue.commit_write();
+        }
     }
 };
 
-template<ValidMarketPacket PacketType>
-void run_matching_engine_consumer(OrderBook& book_obj, ZeroCopySPSC<DataChunk<PacketType>, QUEUE_CAPACITY>& q_ref, size_t total_packets) {
-    
+template<typename PacketType>
+void run_bbo_engine_consumer(BBOBook& book_obj, 
+                             ZeroCopySPSC<DataChunk<PacketType>, QUEUE_CAPACITY>& q_ref, 
+                             size_t total_packets) {
     pin_thread_to_core(4);
     
     size_t processed = 0;
     while (processed < total_packets) {
         const DataChunk<PacketType>* current_slot = q_ref.peek_read_slot();
         if (current_slot != nullptr) {
-            size_t count = current_slot->valid_count;
+            const void* next_slot = q_ref.peek_next_read_slot();
+            __builtin_prefetch(next_slot, 0, 3);
+
+            const size_t count = current_slot->valid_count;
             for (size_t i = 0; i < count; ++i) {
-                const auto& packet = current_slot->packets[i];
-                book_obj.add_in_limit(packet.side == 'B', packet.price, packet.qty);
+                if (i + 4 < count) {
+                    __builtin_prefetch(&current_slot->packets[i + 4], 0, 0);
+                }
+                book_obj.process_packet(current_slot->packets[i]);
             }
+
             processed += count;
             q_ref.commit_read();
-        } 
-        else hardware_spin_relax();
+        } else {
+            hardware_spin_relax();
+        }
     }
 }
 
-template<ValidMarketPacket PacketType>
+template<typename PacketType>
 void run_mock_exchange_tx(int port, size_t total_packets) {
-    
     pin_thread_to_core(2);
 
-    std::cout << "Mock Exchange Thread waiting for Receiver to initialize..." << std::endl;
     while (!is_receiver_ready.load(std::memory_order_acquire)) hardware_spin_relax();
-    std::cout << "Receiver detected! Injecting packets into Port " << port << "..." << std::endl;
 
     int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in serv_addr{};
@@ -190,34 +200,48 @@ void run_mock_exchange_tx(int port, size_t total_packets) {
     serv_addr.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
-    std::cout << "Mock Exchange Thread running on Core 2. Injecting " << total_packets << " packets into Port " << port << "..." << std::endl;
-
     const size_t packets_per_frame = 32; 
     std::vector<PacketType> frame_buffer(packets_per_frame);
 
-    alignas(64) uint32_t rng[SIMD_W];
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) uint32_t rng[SIMD_W];
     for(int i = 0; i < SIMD_W; ++i) rng[i] = 42 + (i * 1000);
 
     simd_reg v_state = LOAD_SIMD(rng);
     simd_reg v_a = SET1_SIMD(1664525u);
     simd_reg v_c = SET1_SIMD(1013904223u);
-
+    
+    int mid = 1000;
     size_t packets_sent = 0;
+
     while (packets_sent < total_packets) {
         for (size_t i = 0; i < packets_per_frame; i += SIMD_W) {
-            
-            v_state = MAC_SIMD(v_state, v_a , v_c);
+            v_state = MAC_SIMD(v_state, v_a, v_c);
             
             alignas(64) uint32_t results[SIMD_W];
             STORE_SIMD(results, v_state);
 
             for(size_t j = 0; j < SIMD_W; ++j) {
                 size_t idx = i + j;
-                frame_buffer[idx].type = 'Q';
-                frame_buffer[idx].order_id = static_cast<uint32_t>(packets_sent + idx + 1);
-                frame_buffer[idx].qty = 1 + (results[j] % 20);
-                frame_buffer[idx].price = MIN_PRICE + (results[j] % LEVELS);
-                frame_buffer[idx].side = (results[j] & 1) ? 'B' : 'S';
+                frame_buffer[idx].timestamp = 0;
+                frame_buffer[idx].order_id  = static_cast<uint32_t>(packets_sent + idx + 1);
+
+                bool is_trade = (results[j] % 10 == 0);
+                frame_buffer[idx].type = is_trade ? 'T' : 'Q';
+
+                int drift = (results[j] % 3) - 1;
+                mid = std::clamp(mid + drift, 950, 1050);
+
+                bool is_buy = (results[j] & 1);
+                frame_buffer[idx].side = is_buy ? 'B' : 'S';
+
+                if (is_trade) {
+                    frame_buffer[idx].price = mid;
+                    frame_buffer[idx].qty   = 1 + (results[j] % 50);
+                } else {
+                    int spread_half = 1 + (results[j] % 3);
+                    frame_buffer[idx].price = is_buy ? (mid - spread_half) : (mid + spread_half);
+                    frame_buffer[idx].qty   = 50 + (results[j] % 500);
+                }
             }
         }
 
@@ -227,7 +251,6 @@ void run_mock_exchange_tx(int port, size_t total_packets) {
         packets_sent += packets_per_frame;
     }
     close(client_fd);
-    std::cout << "Mock Exchange finished transmission." << std::endl;
 }
 
 int main() {
@@ -239,16 +262,20 @@ int main() {
         MarketDataReceiver<ActivePacketType> receiver(zero_copy_queue, BASE_PORT);
         int resolved_port = receiver.get_active_port();
 
-        std::cout << "Starting Lock-Free ZERO-COPY SPSC Pipeline..." << std::endl;
+        std::cout << "Starting Lock-Free ZERO-COPY L1 (BBO) Pipeline..." << std::endl;
         std::cout << "Mock Exchange Thread -> Core 2" << std::endl;
         std::cout << "IO Network Thread    -> Core 3" << std::endl;
-        std::cout << "Matching Engine Core -> Core 4" << std::endl;
+        std::cout << "BBO Engine Core      -> Core 4" << std::endl;
 
         std::thread exchange_thread(run_mock_exchange_tx<ActivePacketType>, resolved_port, TOTAL_PACKETS);
         
         auto start_time = clock::now();
 
-        std::thread engine_thread(run_matching_engine_consumer<ActivePacketType>, std::ref(book), std::ref(zero_copy_queue), TOTAL_PACKETS);
+        std::thread engine_thread(run_bbo_engine_consumer<ActivePacketType>, 
+                                  std::ref(bbo_book), 
+                                  std::ref(zero_copy_queue), 
+                                  TOTAL_PACKETS);
+
         receiver.run_receiver_loop(TOTAL_PACKETS);
         
         if (engine_thread.joinable()) engine_thread.join();
@@ -258,14 +285,22 @@ int main() {
 
         auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
 
-        std::cout << "\n================ ENGINE RUN STATS ================" << std::endl;
+        std::cout << "\n================ L1 BBO ENGINE RUN STATS ================" << std::endl;
         std::cout << "Total Data Streamed    : " << TOTAL_PACKETS << " Packets" << std::endl;
-        std::cout << "Packet Core Footprint  : " << sizeof(ActivePacketType) << " Bytes" << std::endl;
+        std::cout << "Packet Footprint       : " << sizeof(ActivePacketType) << " Bytes" << std::endl;
+        std::cout << "BBO Book Footprint     : " << sizeof(BBOBook) << " Bytes (Single Cache Line)" << std::endl;
         std::cout << "Total Processing Time  : " << duration << " microseconds" << std::endl;
         std::cout << "Average Cost Per Packet: " << (double)duration * 1000.0 / TOTAL_PACKETS << " nanoseconds" << std::endl;
-        std::cout << "Final Matching State   : Best Bid: " << book.get_best_bid() 
-                  << " | Best Ask: " << book.get_best_ask() << std::endl;
-        std::cout << "==================================================" << std::endl;
+        std::cout << "Best Bid (BBO)         : " << bbo_book.get_bid_price() << " (Qty: " << bbo_book.get_bid_qty() << ")" << std::endl;
+        std::cout << "Best Ask (BBO)         : " << bbo_book.get_ask_price() << " (Qty: " << bbo_book.get_ask_qty() << ")" << std::endl;
+        std::cout << "Top-of-Book Spread     : " << bbo_book.spread() << std::endl;
+        std::cout << "Top-of-Book Mid Price  : " << bbo_book.mid_price() << std::endl;
+        std::cout << "Top-of-Book Micro Price: " << bbo_book.micro_price() << std::endl;
+        std::cout << "Book Imbalance (OBI)   : " << bbo_book.imbalance() << std::endl;
+        std::cout << "Last Trade Price       : " << bbo_book.get_last_price() << " (Qty: " << bbo_book.get_last_qty() << ")" << std::endl;
+        std::cout << "Total Traded Volume    : " << bbo_book.get_total_volume() << std::endl;
+        std::cout << "Session VWAP           : " << bbo_book.session_vwap() << std::endl;
+        std::cout << "=========================================================" << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Engine Runtime Failure Exception: " << e.what() << std::endl;

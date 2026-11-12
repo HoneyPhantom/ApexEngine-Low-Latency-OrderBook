@@ -10,6 +10,15 @@
 #include <new>
 #include "concepts.hpp"
 
+#if defined(__APPLE__) && defined(__arm64__)
+constexpr size_t HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE = 128;
+#else
+constexpr size_t HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE = 64;
+#endif
+
+alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) std::atomic<size_t> write_idx{0};
+alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) std::atomic<size_t> read_idx{0};
+
 static constexpr uint32_t NULL_IDX = 0xFFFFFFFF;
 static constexpr size_t CHUNK_SIZE = 64; 
 static constexpr size_t QUEUE_CAPACITY = 512;
@@ -25,13 +34,13 @@ class ZeroCopySPSC {
 private:
     static_assert((Capacity & (Capacity - 1)) == 0 , "Capacity must be power of 2");
 
-    alignas(64) std::atomic<size_t> write_idx{0};
-    alignas(64) size_t write_index_cached = 0;
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) std::atomic<size_t> write_idx{0};
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) size_t write_index_cached = 0;
     
-    alignas(64) std::atomic<size_t> read_idx{0};
-    alignas(64) size_t read_index_cached = 0;
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) std::atomic<size_t> read_idx{0};
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) size_t read_index_cached = 0;
 
-    alignas(64) T buffer[Capacity];
+    alignas(HARDWARE_DESTRUCTIVE_INTERFERENCE_SIZE) T buffer[Capacity];
 
     inline void return_read_cache() { read_index_cached = read_idx.load(std::memory_order_acquire); }
     inline void return_write_cache() { write_index_cached = write_idx.load(std::memory_order_acquire); }
@@ -64,229 +73,189 @@ public:
         return &buffer[curr_read & (Capacity - 1)];
     }
 
+    inline const T* peek_next_read_slot() const {
+        const size_t curr_read = read_idx.load(std::memory_order_relaxed);
+        return &buffer[(curr_read + 1) & (Capacity - 1)];
+    }
+
     inline void commit_read() {
         size_t curr_read = read_idx.load(std::memory_order_relaxed);
         read_idx.store(curr_read + 1, std::memory_order_release);
     }
 };
 
-inline void hardware_spin_relax() {
-#if defined(__ARM_ARCH) || defined(__aarch64__)
-    asm volatile("yield" ::: "memory");
-#else
-    asm volatile("pause" ::: "memory");
-#endif
-}
-
-template<typename T , size_t POOL_SIZE>
-class MemoryPool {
-private:
-    alignas(64) char buffer[POOL_SIZE * sizeof(T)];
-    struct FreeNode { uint32_t next_idx; };
-    uint32_t free_head = 0;
-    
-    inline T* get_slot(size_t idx) { return reinterpret_cast<T*>(&buffer[idx * sizeof(T)]); }
-    inline const T* get_slot(size_t idx) const { return reinterpret_cast<const T*>(&buffer[idx * sizeof(T)]); }
-public:
-    MemoryPool() {
-        for(size_t i = 0; i < POOL_SIZE - 1; ++i) reinterpret_cast<FreeNode*>(get_slot(i))->next_idx = static_cast<uint32_t>(i + 1);
-        reinterpret_cast<FreeNode*>(get_slot(POOL_SIZE - 1))->next_idx = static_cast<uint32_t>(NULL_IDX);
-    }
-
-    uint32_t alloc_raw(){
-        if(free_head == NULL_IDX) [[unlikely]] return NULL_IDX;
-        uint32_t node = free_head;
-        free_head = reinterpret_cast<FreeNode*>(get_slot(node))->next_idx;
-        return node;
-    }
-
-    void dealloc_raw(uint32_t idx){
-        if(idx == NULL_IDX || idx >= POOL_SIZE) return;
-        reinterpret_cast<FreeNode*>(get_slot(idx))->next_idx = free_head;
-        free_head = idx;
-    }
-
-    template <class... Args>
-    uint32_t create(Args&&... args) {
-        uint32_t idx = alloc_raw();
-        if (idx == NULL_IDX) return NULL_IDX;
-        new (get_slot(idx)) T(std::forward<Args>(args)...);
-        return idx;
-    }
-
-    void destroy(uint32_t idx) {
-        if(idx == NULL_IDX || idx >= POOL_SIZE) return;
-        get_slot(idx)->~T();
-        dealloc_raw(idx);
-    }
-
-    inline T& operator[](size_t idx) { return const_cast<T&>(static_cast<const MemoryPool&>(*this)[idx]); }
-    inline const T& operator[](size_t idx) const { return *get_slot(idx); }
-    inline T* get_base_ptr() { return reinterpret_cast<T*>(buffer); }
-};
-
-struct Order {
-    uint32_t id;
-    uint32_t qty;
-    int price;
-    uint32_t next_idx;
-    Order(uint32_t id_, uint32_t qty_, int price_) : id(id_), qty(qty_), price(price_), next_idx(NULL_IDX) {}
-};
-
-struct Level {
-    uint32_t head = NULL_IDX;
-    uint32_t tail = NULL_IDX;
-
-    inline void push(Order* pool , uint32_t new_order_idx){
-        pool[new_order_idx].next_idx = NULL_IDX;
-        if(tail == NULL_IDX) head = tail = new_order_idx;
-        else {
-            pool[tail].next_idx = new_order_idx;
-            tail = new_order_idx;
-        }
-    }
-
-    inline uint32_t pop(Order* pool){
-        if(head == NULL_IDX) return NULL_IDX;
-        uint32_t x = head;
-        head = pool[x].next_idx;
-        if(empty()) tail = NULL_IDX;
-        return x;
-    }
-    inline uint32_t top() const { return head; }
-    inline bool empty() const { return head == NULL_IDX; }
-};
-
 static constexpr int MIN_PRICE = 900;
 static constexpr int MAX_PRICE = 1100;
 static constexpr int LEVELS = MAX_PRICE - MIN_PRICE + 1;
-inline int idx(int price){ return price - MIN_PRICE; }
+inline int idx(int price) { return price - MIN_PRICE; }
+inline int price(int idx) { return idx + MIN_PRICE; }
 
 template<int Levels>
 class Pricemap {
 private:
-    static constexpr size_t BLOCKS1 = (Levels + 63) / 64;
-    static constexpr size_t BLOCKS2 = (BLOCKS1 + 63) / 64;
-    uint64_t mask_level1[BLOCKS1] = {0};
-    uint64_t mask_level2[BLOCKS2] = {0};
+    static constexpr size_t BLOCKS = (Levels + 63) / 64;
+    uint64_t mask_level1[BLOCKS]{0};
+    uint64_t mask_level2 = 0;
 
 public:
     inline void set(int idx) {
-        const int l1_idx = idx >> 6, l2_idx = l1_idx >> 6;
+        const size_t l1_idx = static_cast<size_t>(idx) >> 6;
         mask_level1[l1_idx] |= (1ULL << (idx & 63));
-        mask_level2[l2_idx] |= (1ULL << (l1_idx & 63)); 
+        mask_level2 |= (1ULL << l1_idx); 
     }
     inline void clear(int idx) {
-        const int l1_idx = idx >> 6, l2_idx = l1_idx >> 6;
+        const size_t l1_idx = static_cast<size_t>(idx) >> 6;
         mask_level1[l1_idx] &= ~(1ULL << (idx & 63));
-        if(!mask_level1[l1_idx]) {
-            mask_level2[l2_idx] &= ~(1ULL << (l1_idx & 63));
-        }
+        if(!mask_level1[l1_idx]) mask_level2 &= ~(1ULL << l1_idx);
     }
     inline int find_max() const {
-        if constexpr (BLOCKS2 == 1) {
-            if (mask_level2[0]) {
-                int l2_bit = 63 - __builtin_clzll(mask_level2[0]);
-                return (l2_bit << 6) | (63 - __builtin_clzll(mask_level1[l2_bit]));
-            }
-        } 
-        else {
-            for(int i = static_cast<int>(BLOCKS2) - 1; i >= 0; --i) {
-                if (mask_level2[i]) {
-                    int l2_bit = 63 - __builtin_clzll(mask_level2[i]);
-                    int block_idx = (i << 6) | l2_bit;
-                    return (block_idx << 6) | (63 - __builtin_clzll(mask_level1[block_idx]));
-                }
-            }
-        }
-        return -1;
+        if (!mask_level2) return -1;
+        const size_t l2_bit = 63 - __builtin_clzll(mask_level2);
+        const size_t l1_bit = 63 - __builtin_clzll(mask_level1[l2_bit]);
+        return (l2_bit << 6) | l1_bit;
     }
     inline int find_min() const {
-        if constexpr (BLOCKS2 == 1) {
-            if (mask_level2[0]) {
-                int l2_bit = __builtin_ctzll(mask_level2[0]);
-                return (l2_bit << 6) | __builtin_ctzll(mask_level1[l2_bit]);
-            }
-        } 
-        else {
-            for(size_t i = 0; i < BLOCKS2; ++i) {
-                if (mask_level2[i]) {
-                    int l2_bit = __builtin_ctzll(mask_level2[i]);
-                    size_t block_idx = (i << 6) | l2_bit;
-                    return static_cast<int>((block_idx << 6) | (__builtin_ctzll(mask_level1[block_idx])));
-                }
-            }
+        if (!mask_level2) return -1;
+        const size_t l2_bit = __builtin_ctzll(mask_level2);
+        const size_t l1_bit = __builtin_ctzll(mask_level1[l2_bit]);
+        return (l2_bit << 6) | l1_bit;
+    }
+    inline void clear_less(int idx) {
+        if (idx < 0) [[unlikely]] return;
+        if (idx >= Levels - 1) [[unlikely]] {
+            for (size_t i = 0; i < BLOCKS; ++i) mask_level1[i] = 0;
+            mask_level2 = 0;
+            return;
         }
+        const size_t l1_idx = static_cast<size_t>(idx) >> 6;
+        const size_t l1_bit = static_cast<size_t>(idx) & 63;
+        for (size_t i = 0; i < l1_idx; ++i) mask_level1[i] = 0;
+        mask_level1[l1_idx] &= (l1_bit == 63) ? 0ULL : (~0ULL << (l1_bit + 1));
+        mask_level2 = (mask_level2 & ((l1_idx >= 63) ? 0ULL : (~0ULL << (l1_idx + 1)))) | (static_cast<uint64_t>(mask_level1[l1_idx] != 0) << l1_idx);
+    }
+    inline void clear_great(int idx) {
+        if (idx <= 0) [[unlikely]] {
+            if (idx == 0) {
+                for (size_t i = 0; i < BLOCKS; ++i) mask_level1[i] = 0;
+                mask_level2 = 0;
+            }
+            return;
+        }
+        if (idx >= Levels) [[unlikely]] return;
+        const size_t l1_idx = static_cast<size_t>(idx) >> 6;
+        const size_t l1_bit = static_cast<size_t>(idx) & 63;
+        for (size_t i = l1_idx + 1; i < BLOCKS; ++i) mask_level1[i] = 0;
+        mask_level1[l1_idx] &= (1ULL << l1_bit) - 1ULL;
+        mask_level2 = (mask_level2 & ((1ULL << l1_idx) - 1ULL)) | (static_cast<uint64_t>(mask_level1[l1_idx] != 0) << l1_idx);
+    }
+};
+
+struct Snapshot {
+    int bid_price = -1;
+    uint32_t bid_qty = 0;
+    int ask_price = -1;
+    uint32_t ask_qty = 0;
+    inline int spread() const {
+        if (bid_price != -1 && ask_price != -1 && ask_price >= bid_price) return ask_price - bid_price;
         return -1;
+    }
+
+    inline double mid_price() const {
+        if (bid_price != -1 && ask_price != -1) return (bid_price + ask_price) * 0.5;
+        return 0.0;
     }
 };
 
 enum Side : bool { Sell = false, Buy = true };
 
-class alignas(64) OrderBook {
-private:
-    alignas(64) Level bids[LEVELS];
-    alignas(64) Level asks[LEVELS];
-    MemoryPool<Order , 1000000> pool;
-    uint32_t next_idx = 1;
-    Pricemap<LEVELS> bid_mask, ask_mask;
-
-    inline uint32_t branchless_min(const uint32_t& a , const uint32_t& b){
-        return b + ((a - b) & ((int32_t)(a - b) >> 31));
-    }
-    inline void enqueue_bid(int price , uint32_t qty){
-        uint32_t id = pool.create(next_idx++ , qty , price);
-        if(id == NULL_IDX) [[unlikely]] return;
-        int price_idx = idx(price);
-        bids[price_idx].push(get_raw_pool() , id);
-        bid_mask.set(price_idx);
-    }
-    inline void enqueue_ask(int price , uint32_t qty){
-        uint32_t id = pool.create(next_idx++ , qty , price);
-        if(id == NULL_IDX) [[unlikely]] return;
-        int price_idx = idx(price);
-        asks[price_idx].push(get_raw_pool() , id);
-        ask_mask.set(price_idx);
-    }
-    
+class OrderBook {
+    Pricemap<LEVELS> bid_mask;
+    Pricemap<LEVELS> ask_mask;
+    int best_bid_idx = -1;
+    int best_ask_idx = -1;
+    uint32_t bids_qty[LEVELS]{0};
+    uint32_t asks_qty[LEVELS]{0};
     template<Side S>
-    [[gnu::always_inline]] void handle_order(int price, uint32_t qty) {
+    [[gnu::always_inline]] void update_level(int price, uint32_t qty) {
         constexpr bool IsBuy = (S == Side::Buy);
-        Order* raw_pool = get_raw_pool();
-        auto& target_levels = *(IsBuy ? &asks : &bids);
-        auto& target_mask  = IsBuy ? ask_mask : bid_mask;
-        while(qty > 0){
-            int best_idx = IsBuy ? target_mask.find_min() : target_mask.find_max();
-            if(best_idx == -1 || (IsBuy ? (best_idx + MIN_PRICE > price) : (best_idx + MIN_PRICE < price))) break;
-            auto& lvl = target_levels[best_idx];
-            while(qty > 0 && !lvl.empty()){
-                uint32_t id = lvl.top();
-                Order& o = pool[id];
-                uint32_t traded = branchless_min(o.qty, qty);
-                o.qty -= traded;
-                qty -= traded;
-                if(o.qty == 0) pool.destroy(lvl.pop(raw_pool));
+        const int p_idx = idx(price);
+        uint32_t* side = (IsBuy ? bids_qty : asks_qty);
+        auto& mask = (IsBuy ? bid_mask : ask_mask);
+        side[p_idx] = qty;
+        if (qty > 0) {
+            mask.set(p_idx);
+            if constexpr (IsBuy) {
+                if (best_ask_idx != -1 && best_ask_idx <= p_idx) {
+                    ask_mask.clear_less(p_idx);
+                    memset(&asks_qty[best_ask_idx] , 0 , (p_idx - best_ask_idx + 1) * sizeof(uint32_t));
+                    best_ask_idx = ask_mask.find_min();
+                }
+                best_bid_idx = std::max(best_bid_idx , p_idx);
+            } 
+            else {
+                if (best_bid_idx != -1 && best_bid_idx >= p_idx) {
+                    bid_mask.clear_great(p_idx);
+                    memset(&bids_qty[p_idx] , 0 , (best_bid_idx - p_idx + 1) * sizeof(uint32_t));
+                    best_bid_idx = bid_mask.find_max();
+                }
+                if (best_ask_idx == -1 || p_idx < best_ask_idx) best_ask_idx = p_idx;
             }
-            if(lvl.empty()) target_mask.clear(best_idx);
         }
-        if(qty > 0) {
-            if constexpr (IsBuy) enqueue_bid(price, qty);
-            else enqueue_ask(price, qty);
+        else {
+            mask.clear(p_idx);
+            if constexpr (IsBuy) {
+                if (p_idx == best_bid_idx) [[unlikely]] best_bid_idx = bid_mask.find_max();
+            } else {
+                if (p_idx == best_ask_idx) [[unlikely]] best_ask_idx = ask_mask.find_min();
+            }
         }
     }
+    /*
+    template<Side S>
+    [[gnu::always_inline]] void delta_level(int price, uint32_t qty) {
+        constexpr bool IsBuy = (S == Side::Buy);
+        const int p_idx = idx(price);
+        uint32_t* side = (IsBuy ? bids_qty : asks_qty);
+        auto& mask = (IsBuy ? bid_mask : ask_mask);
+        const int64_t updated_qty = static_cast<int64_t>(side[p_idx]) + qty;
+        if (updated_qty > 0) [[likely]] {
+            side[p_idx] = static_cast<uint32_t>(updated_qty);
+            mask.set(p_idx);
+        }
+        else {
+            side[p_idx] = 0;
+            mask.clear(p_idx);
+        }
+    }
+    */
 public:
-    inline Order* get_raw_pool() { return pool.get_base_ptr(); }
-    inline int get_best_bid() const{ 
-        int idx = bid_mask.find_max();
-        return idx == -1 ? -1 : idx + MIN_PRICE;
+    inline int get_best_bid_price() const { 
+        return best_bid_idx == -1 ? -1 : best_bid_idx + MIN_PRICE;
     }
-    inline int get_best_ask() const{ 
-        int idx = ask_mask.find_min();
-        return idx == -1 ? -1 : idx + MIN_PRICE; 
+    inline uint32_t get_best_bid_qty() const {
+        return best_bid_idx == -1 ? 0 : bids_qty[best_bid_idx];
     }
-    void add_in_limit(bool is_buy , int price , uint32_t qty){
+    inline int get_best_ask_price() const { 
+        return best_ask_idx == -1 ? -1 : best_ask_idx + MIN_PRICE; 
+    }
+    inline uint32_t get_best_ask_qty() const {
+        return best_ask_idx == -1 ? 0 : asks_qty[best_ask_idx];
+    }
+    inline Snapshot get_snapshot() const {
+        Snapshot snap;
+        if (best_bid_idx != -1) {
+            snap.bid_price = price(best_bid_idx);
+            snap.bid_qty = bids_qty[best_bid_idx];
+        }
+        if (best_ask_idx != -1) {
+            snap.ask_price = price(best_ask_idx);
+            snap.ask_qty = asks_qty[best_ask_idx];
+        }
+        return snap;
+    }
+    template<Side side>
+    [[gnu::always_inline]] inline void add_in_limit(int price , uint32_t qty){
         if(price < MIN_PRICE || price > MAX_PRICE) [[unlikely]] return;
-        if(is_buy) handle_order<Side::Buy>(price, qty);
-        else handle_order<Side::Sell>(price, qty);
+        update_level<side>(price, qty);
     }
 };
